@@ -1,50 +1,93 @@
-RP2040 Distributed Wheel Controller
-📌 Context & Background
-Over the past year, I've been developing embedded software for rover control systems. In large-scale autonomous rovers, routing all sensory feedback and motor PWM signals to a single central computer creates massive processing bottlenecks and single points of failure.
+# RP2040 Distributed Wheel Controller
 
-To solve this, we moved to a distributed architecture. This repository contains the independent wheel controller module I developed. I have extracted, sanitized, and refactored this specific subsystem from our private team repository to serve as a standalone portfolio piece. It demonstrates how I handle real-time hardware control, networking, and safety failsafes on bare-metal silicon.
+Over the past year I've been working on a large-scale autonomous rover project as part of a team. The full system — central navigation, sensor fusion, communication stack, everything — lives in a private team repository that I can't share publicly.
 
-⚙️ Hardware Stack
-Microcontroller: Raspberry Pi Pico (RP2040) overclocked to 133MHz
+This is one module from that system. I extracted it, cleaned it up, and put it here as a standalone piece because it represents a real engineering problem I had to think through and solve, not just code I wrote following a spec.
 
-Network: WIZnet W5500 Ethernet Controller (Hardwired TCP/IP)
+---
 
-Motor Driver: RoboClaw (via Non-blocking UART)
+## The problem it solves
 
-Feedback: AS5600 Magnetic Encoder (via I2C)
+Early in the project we had one central computer handling everything — reading sensors, computing paths, sending PWM signals to all four wheels. It worked at first. Then we added more sensors, more wheels, more logic, and it started falling apart. Latency crept up. One bug in the motor code could freeze the whole system. Wiring became a nightmare.
 
-🏗️ What This Code Actually Does
-Instead of dumb PWM forwarding, this firmware turns each wheel into an independent "smart node" on the rover's local network:
+The fix was to stop treating wheels as dumb actuators and turn each one into its own controller. The central computer now just sends high-level commands over the local network. Each wheel handles its own feedback loop, its own safety logic, its own motor control. If one wheel has a problem, the others keep running.
 
-High-Throughput JSON Server: Runs a custom, lightweight TCP server that parses incoming JSON trajectory commands with near-zero latency.
+This firmware is what runs on each wheel.
 
-Hardware-Level PID: The central computer doesn't micromanage the steering. It just sends {"topic": "steering_angle", "angle": "45"}. The RP2040 handles the closed-loop PID calculations locally at 50Hz, including integral anti-windup (crucial for overcoming static friction on rough terrain).
+---
 
-Smooth Drive Ramping: Sudden speed changes pull massive current spikes. I implemented algorithmic ramp-rates (DRIVE_RAMP_RATE) to protect the mechanical drivetrain and power distribution board.
+## What it actually does
 
-The "Deadman's Switch" (Watchdog): In autonomous systems, connection loss is fatal. If the TCP socket drops or no commands are received for 2000ms, the failsafe triggers, hardware-halting the RoboClaw immediately.
+**Steering** is a closed-loop PID running at 50Hz against an AS5600 magnetic encoder. One thing that took real tuning time was integral anti-windup — on rough terrain, static friction causes the integral term to wind up and the wheel overshoots significantly. Getting that right took a few iterations of field testing.
 
-🚀 Network Scalability
-The architecture is designed so the same exact firmware runs on all 4 (or 6) wheels. By simply changing #define WHEEL_NUMBER 1 at compile time, the node dynamically calculates its own static IP, MAC address, and specific TCP Port based on the base offsets.
+**Drive speed** ramps instead of jumping. We were getting brownouts on the power distribution board from hard acceleration current spikes. The ramp rate is a single tunable define now, but finding the right value came from actually watching the system fail.
 
-Wheel 1 -> 10.42.0.30:8000
+**Deadman's switch** — if no command arrives for 2 seconds, motors halt immediately. This wasn't in the original design. We added it after a test run where a Wi-Fi dropout left a wheel spinning with nobody noticing for a few seconds. On a rover that can weigh 30+ kg, that's not acceptable.
 
-Wheel 2 -> 10.42.0.32:8001
+**Network identity** — the same binary runs on all wheels. `WHEEL_NUMBER` at compile time sets the IP, MAC, and port automatically. Deploying a new wheel is a one-line change and a flash.
 
-...and so on.
+---
 
-🛠️ Build Instructions
-Standard Pico C/C++ SDK build process:
+## Hardware
 
-Bash
-mkdir build
-cd build
+| Component | Details |
+|---|---|
+| MCU | Raspberry Pi Pico (RP2040) @ 133MHz |
+| Ethernet | WIZnet W5500 (hardwired TCP/IP over SPI) |
+| Motor driver | RoboClaw (simple serial, non-blocking UART) |
+| Steering feedback | AS5600 magnetic encoder (I2C) |
+
+---
+
+## Network layout
+
+```
+Wheel 1 → 10.42.0.30 : 8000
+Wheel 2 → 10.42.0.32 : 8001
+Wheel 3 → 10.42.0.34 : 8002
+Wheel 4 → 10.42.0.36 : 8003
+```
+
+---
+
+## Protocol
+
+Plain JSON over TCP, newline-terminated.
+
+```json
+{"topic": "steering_angle", "angle": "45"}
+{"topic": "drive_speed", "speed": "75"}
+{"command": "get_status"}
+```
+
+Full reference: [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
+
+---
+
+## Build
+
+```bash
+mkdir build && cd build
 cmake ..
 make -j4
+```
 
-📝 Lessons Learned & Future TODOs
-JSON Parser: The current string-manipulation JSON parser is fast but a bit brittle. Planning to migrate to a more robust state-machine parser like jsmn in the future.
+Set `WHEEL_NUMBER` in `main.c` before flashing.
 
-Calibration Offsets: Currently, the AS5600 encoder offsets are hardcoded in the header. They need to be moved to the RP2040's flash memory so we don't have to recompile every time a wheel gets mechanically realigned.
+---
 
-UART Initialization: Discovered that occasionally the RoboClaw drops the first byte at 38400 baud on a cold boot. Future fix will include a minor hardware delay check before the first transmission.
+## What I'd fix next
+
+**JSON parser** — hand-rolled string scanner, fast but brittle. Would replace with `jsmn` or a proper state machine.
+
+**Encoder calibration in flash** — zero-offsets are currently hardcoded. Every mechanical realignment means a recompile. The RP2040 has plenty of flash, this should be stored and updated at runtime.
+
+**UART cold boot drop** — intermittently the RoboClaw drops the first byte at 38400 baud on power-on. Likely a timing issue between the UART init and the RoboClaw's startup sequence. A dummy byte or a short delay before the first real command would probably fix it. Haven't had the hardware in front of me to test it properly yet.
+
+---
+
+## Docs
+
+- [`docs/HARDWARE.md`](docs/HARDWARE.md) — pin assignments, wiring
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — JSON command reference  
+- [`docs/CALIBRATION.md`](docs/CALIBRATION.md) — encoder calibration
