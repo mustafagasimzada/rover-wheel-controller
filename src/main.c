@@ -738,4 +738,4 @@ static void set_clock_khz(void) {
         PLL_SYS_KHZ * 1000,
         PLL_SYS_KHZ * 1000
     );
-} bu main c necedi ai kimi durur yoxsa telebe kimi
+} 
